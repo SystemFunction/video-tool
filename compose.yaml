@@ -1,0 +1,21 @@
+services:
+  video-tool:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: video-tool:0.0.1
+    container_name: video-tool
+    restart: unless-stopped
+    ports:
+      - "8550:8550"
+    environment:
+      TZ: Europe/Berlin
+    volumes:
+      # Heruntergeladene / konvertierte Videos landen hier auf dem Pi.
+      # Pfad ggf. an deine SSD / NAS-Mount anpassen.
+      - ./downloads:/downloads
+      # Config + lokal aktualisiertes yt-dlp ueberlebt Container-Rebuilds.
+      - video-tool-config:/root/.video_tool_v3
+
+volumes:
+  video-tool-config:
