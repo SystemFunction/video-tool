@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
 import platform
@@ -41,6 +42,10 @@ FLET_MIN = "0.28.0"        # informational only - the API has been stable since 
 
 
 def _install_deps() -> None:
+    # Perf: a frozen build (PyInstaller etc.) ships its own dependencies -
+    # skip the check entirely.
+    if getattr(sys, "frozen", False):
+        return
     # Perf: importlib.util.find_spec is *significantly* faster than
     # importlib.metadata.version() - the latter scans every dist-info
     # directory under site-packages on Windows (~50-500 ms), find_spec
@@ -62,12 +67,15 @@ def _install_deps() -> None:
 _install_deps()
 
 import flet as ft  # noqa: E402
-import requests  # noqa: E402
+
+# Perf: `requests` is imported lazily inside the few functions that need it
+# (binary installer, update checks). A module-level import cost 0.2-0.4 s on
+# every startup even though a normal session never touches the network.
 
 
 # ============================== constants =========================================
 
-VERSION = "0.0.1"
+VERSION = "0.0.2"
 APP_NAME = "Video Tool"
 
 # Set this to your GitHub repo ("owner/name") before publishing to enable
@@ -190,6 +198,13 @@ def open_folder(path: str) -> None:
         pass
 
 
+# Hosts that block yt-dlp's default TLS fingerprint - impersonation is
+# auto-enabled for these when curl_cffi support is available.
+_IMPERSONATE_AUTO_HOSTS = (
+    "instagram.com", "tiktok.com", "twitter.com",
+    "//x.com", "www.x.com", "facebook.com", "fb.watch",
+)
+
 # precomputed keyword tuples - no new tuple per log line
 _KW_ERROR = ("error", "failed", "traceback", "warning", "warn")
 _KW_SUCCESS = ("success", "completed", "complete")
@@ -286,6 +301,7 @@ def check_tool_update(timeout: int = 8) -> tuple[bool, str, str]:
     """
     if not GITHUB_REPO or GITHUB_REPO.startswith("yourusername"):
         return False, "", ""
+    import requests
     try:
         r = requests.get(
             f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
@@ -469,6 +485,7 @@ class BinaryManager:
         """
         if not str(url).lower().startswith("https://"):
             raise ValueError(f"Refusing non-HTTPS download URL: {url!r}")
+        import requests
         tmp = target.with_suffix(target.suffix + ".part")
         success = False
         try:
@@ -523,6 +540,7 @@ class BinaryManager:
             "https://github.com/yt-dlp/yt-dlp/releases/latest/download/"
             "SHA2-256SUMS"
         )
+        import requests
         try:
             resp = requests.get(sums_url, timeout=30)
             resp.raise_for_status()
@@ -589,6 +607,7 @@ class BinaryManager:
         # Invalidate eagerly - even if we error halfway through, the partial
         # state should re-resolve cleanly on the next path lookup.
         self.invalidate_cache()
+        import requests
         platform_key = self._ffmpeg_platform_key()
         data = requests.get("https://ffbinaries.com/api/v1/version/latest", timeout=30).json()
         binaries = data.get("bin", {}).get(platform_key, {})
@@ -764,6 +783,13 @@ class VideoToolApp:
         self._init_page()
         self._build_ui()
         self._refresh(immediate=True)
+
+        # Prefill the URL field (clipboard URL > last used URL) right
+        # after the first frame.
+        try:
+            self.page.run_task(self._prefill_url_async)
+        except Exception:
+            pass
 
         # Start the background probe as soon as the UI is visible.
         # page.run_thread runs on the same worker pool as the install
@@ -1078,7 +1104,7 @@ class VideoToolApp:
 
         # ---- Gradient header ----
         header = ft.Container(
-            height=66,
+            height=58,
             padding=ft.Padding(left=22, right=22, top=0, bottom=0),
             gradient=ft.LinearGradient(
                 begin=ft.Alignment(-1, 0), end=ft.Alignment(1, 0),
@@ -1092,8 +1118,8 @@ class VideoToolApp:
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
                 controls=[
                     ft.Row(spacing=12, controls=[
-                        ft.Icon(ft.Icons.MOVIE_FILTER, color=ACCENT_PRIMARY, size=30),
-                        ft.Text(APP_NAME, size=22, weight=ft.FontWeight.BOLD),
+                        ft.Icon(ft.Icons.MOVIE_FILTER, color=ACCENT_PRIMARY, size=26),
+                        ft.Text(APP_NAME, size=19, weight=ft.FontWeight.BOLD),
                         ft.Container(
                             bgcolor=ft.Colors.with_opacity(0.30, ACCENT_PRIMARY),
                             border_radius=8,
@@ -1205,6 +1231,7 @@ class VideoToolApp:
             hint_text="YouTube, TikTok, X/Twitter, Instagram ...",
             prefix_icon=ft.Icons.LINK,
             border_radius=10, expand=True,
+            on_submit=self.start_download,
         )
         paste_btn = ft.IconButton(
             icon=ft.Icons.CONTENT_PASTE,
@@ -1360,63 +1387,145 @@ class VideoToolApp:
 
         log_panel = ft.Container(
             content=self.download_log, height=210,
-            border=ft.Border.all(1, BORDER_SOFT),
-            border_radius=10, padding=8,
-            bgcolor=SURFACE_PANEL,
+            border=ft.Border.all(1, BORDER_FAINT),
+            border_radius=10, padding=10,
+            bgcolor=ft.Colors.with_opacity(0.35, ft.Colors.BLACK),
         )
 
         self.download_start_btn = ft.FilledButton(
-            "Start Download", icon=ft.Icons.DOWNLOAD,
+            "Start Download", icon=ft.Icons.DOWNLOAD, height=44,
             on_click=self.start_download,
         )
         self.download_stop_btn = ft.FilledButton(
-            "Stop", icon=ft.Icons.STOP,
+            "Stop", icon=ft.Icons.STOP, height=44,
             on_click=self.stop_download, disabled=True,
             style=ft.ButtonStyle(bgcolor=ft.Colors.RED_700),
         )
-        clear_log_btn = ft.TextButton(
-            "Clear Log", icon=ft.Icons.DELETE_SWEEP,
+        clear_log_btn = ft.IconButton(
+            icon=ft.Icons.DELETE_SWEEP, icon_size=18,
+            tooltip="Clear log",
             on_click=lambda e: self._clear_log("download"),
-            style=ft.ButtonStyle(color=ft.Colors.GREY_500),
         )
 
-        options_card = ft.Card(content=ft.Container(
-            padding=14,
+        # ---- Advanced options: collapsed by default to keep the tab tidy ----
+        self._adv_more_icon = ft.Icon(
+            ft.Icons.EXPAND_MORE, size=18, color=ft.Colors.GREY_400,
+        )
+        self._adv_less_icon = ft.Icon(
+            ft.Icons.EXPAND_LESS, size=18, color=ft.Colors.GREY_400, visible=False,
+        )
+        self.advanced_panel = ft.Container(
+            visible=False,
+            padding=ft.Padding(left=2, right=2, top=4, bottom=0),
             content=ft.Column(spacing=10, controls=[
-                ft.Row(spacing=12, controls=[self.download_quality, self.download_cookies]),
-                self.cookies_file_row,
-                ft.Divider(height=1, color=BORDER_FAINT),
-                ft.Text("Advanced", size=12, color=ft.Colors.GREY_400, weight=ft.FontWeight.W_500),
-                ft.Row(spacing=20, controls=[self.toggle_impersonate, self.toggle_sponsorblock]),
-                ft.Row(spacing=20, controls=[self.toggle_embed, self.toggle_subs, self.subs_lang]),
-                ft.Row(spacing=20, controls=[self.toggle_potoken, self.potoken_url]),
+                ft.Row(spacing=24, wrap=True, controls=[
+                    self.toggle_impersonate,
+                    self.toggle_sponsorblock,
+                    self.toggle_embed,
+                ]),
+                ft.Row(
+                    spacing=24, wrap=True,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[self.toggle_subs, self.subs_lang],
+                ),
+                ft.Row(
+                    spacing=24, wrap=True,
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    controls=[self.toggle_potoken, self.potoken_url],
+                ),
             ]),
-        ))
+        )
+        advanced_toggle = ft.Container(
+            on_click=self._toggle_advanced,
+            border_radius=8,
+            padding=ft.Padding(left=4, right=8, top=6, bottom=6),
+            content=ft.Row(spacing=6, controls=[
+                ft.Icon(ft.Icons.TUNE, size=16, color=ft.Colors.GREY_400),
+                ft.Text("Advanced options", size=12,
+                        color=ft.Colors.GREY_300, weight=ft.FontWeight.W_500),
+                self._adv_more_icon,
+                self._adv_less_icon,
+            ]),
+        )
+
+        source_card = self._section_card(
+            ft.Icons.LINK, "Source & Quality",
+            ft.Row(controls=[self.download_url, paste_btn]),
+            ft.Row(spacing=12, wrap=True,
+                   controls=[self.download_quality, self.download_cookies]),
+            self.cookies_file_row,
+            advanced_toggle,
+            self.advanced_panel,
+        )
+        dest_card = self._section_card(
+            ft.Icons.FOLDER, "Save Location",
+            ft.Row(controls=[self.download_output, folder_btn, self.open_folder_btn]),
+        )
+        action_row = ft.Row(
+            spacing=10, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                self.download_start_btn,
+                self.download_stop_btn,
+                ft.Container(width=8),
+                ft.Column(spacing=5, expand=True, controls=[
+                    self.download_status,
+                    self.download_progress,
+                ]),
+            ],
+        )
+        log_card = self._section_card(
+            ft.Icons.TERMINAL, "Live Log",
+            log_panel,
+            trailing=clear_log_btn,
+        )
 
         return ft.Container(
-            expand=True, padding=24,
+            expand=True,
+            padding=ft.Padding(left=28, right=28, top=20, bottom=20),
             content=ft.Column(expand=True, spacing=14, scroll=ft.ScrollMode.AUTO, controls=[
-                ft.Text("Download", size=20, weight=ft.FontWeight.BOLD),
-                ft.Text(
-                    "Download videos and audio (H.264 preferred for Vegas Pro)",
-                    color=ft.Colors.GREY_400, size=13,
-                ),
-                ft.Divider(height=1, color=BORDER_FAINT),
-                ft.Row(controls=[self.download_url, paste_btn]),
-                ft.Row(controls=[self.download_output, folder_btn, self.open_folder_btn]),
-                options_card,
-                ft.Row(spacing=10, controls=[
-                    self.download_start_btn,
-                    self.download_stop_btn,
-                    ft.Container(expand=True),
-                    clear_log_btn,
+                ft.Column(spacing=2, controls=[
+                    ft.Text("Download", size=22, weight=ft.FontWeight.BOLD),
+                    ft.Text(
+                        "Videos & audio from YouTube, Instagram, TikTok, X and 1700+ sites",
+                        color=ft.Colors.GREY_500, size=12,
+                    ),
                 ]),
-                self.download_progress,
-                self.download_status,
-                ft.Text("Live Log", weight=ft.FontWeight.BOLD, size=13, color=ft.Colors.GREY_300),
-                log_panel,
+                source_card,
+                dest_card,
+                action_row,
+                log_card,
             ]),
         )
+
+    def _section_card(self, icon, title: str, *controls, trailing=None) -> ft.Container:
+        """Uniform section container - keeps the tabs visually consistent."""
+        header = ft.Row(
+            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.Row(spacing=8, controls=[
+                    ft.Icon(icon, size=16, color=ACCENT_PRIMARY),
+                    ft.Text(title, size=13, weight=ft.FontWeight.W_600,
+                            color=ft.Colors.GREY_200),
+                ]),
+            ],
+        )
+        if trailing is not None:
+            header.controls.append(trailing)
+        return ft.Container(
+            bgcolor=SURFACE_PANEL,
+            border=ft.Border.all(1, BORDER_FAINT),
+            border_radius=14,
+            padding=ft.Padding(left=16, right=16, top=14, bottom=14),
+            content=ft.Column(spacing=12, controls=[header, *controls]),
+        )
+
+    def _toggle_advanced(self, e=None) -> None:
+        expanded = not self.advanced_panel.visible
+        self.advanced_panel.visible = expanded
+        self._adv_more_icon.visible = not expanded
+        self._adv_less_icon.visible = expanded
+        self._refresh(immediate=True)
 
     # ========================= Convert Tab ========================================
 
@@ -1542,9 +1651,11 @@ class VideoToolApp:
         return ft.Container(
             expand=True, padding=24,
             content=ft.Column(expand=True, spacing=12, scroll=ft.ScrollMode.AUTO, controls=[
-                ft.Text("Convert", size=20, weight=ft.FontWeight.BOLD),
-                ft.Text("FFmpeg conversion with live progress", color=ft.Colors.GREY_400, size=13),
-                ft.Divider(height=1, color=BORDER_FAINT),
+                ft.Column(spacing=2, controls=[
+                    ft.Text("Convert", size=22, weight=ft.FontWeight.BOLD),
+                    ft.Text("FFmpeg conversion with live progress",
+                            color=ft.Colors.GREY_500, size=12),
+                ]),
                 ft.Row(controls=[
                     self.convert_input,
                     ft.IconButton(icon=ft.Icons.FILE_OPEN, tooltip="Choose file", on_click=self.pick_input_file),
@@ -1619,9 +1730,11 @@ class VideoToolApp:
         return ft.Container(
             expand=True, padding=24,
             content=ft.Column(spacing=14, controls=[
-                ft.Text("Setup", size=20, weight=ft.FontWeight.BOLD),
-                ft.Text("Manage yt-dlp and FFmpeg", color=ft.Colors.GREY_400, size=13),
-                ft.Divider(height=1, color=BORDER_FAINT),
+                ft.Column(spacing=2, controls=[
+                    ft.Text("Setup", size=22, weight=ft.FontWeight.BOLD),
+                    ft.Text("Manage yt-dlp and FFmpeg",
+                            color=ft.Colors.GREY_500, size=12),
+                ]),
                 ft.Card(content=ft.Container(
                     padding=14,
                     content=ft.Column(spacing=12, controls=[
@@ -1840,14 +1953,37 @@ class VideoToolApp:
     def _paste_url(self, e) -> None:
         self.page.run_task(self._paste_url_async)
 
-    async def _paste_url_async(self) -> None:
+    async def _read_clipboard(self) -> str:
+        """Reads the clipboard - Clipboard.get() is async in newer Flet
+        versions and sync in older ones; handle both."""
         try:
-            text = self.clipboard.get()
-            if text and text.strip():
-                self.download_url.value = text.strip()
-                self._refresh(immediate=True)
+            res = self.clipboard.get()
+            if inspect.isawaitable(res):
+                res = await res
+            return (res or "").strip()
         except Exception:
-            pass
+            return ""
+
+    async def _paste_url_async(self) -> None:
+        text = await self._read_clipboard()
+        if text:
+            self.download_url.value = text
+            self._refresh(immediate=True)
+
+    async def _prefill_url_async(self) -> None:
+        """Prefills the URL field on startup: a URL from the clipboard wins,
+        otherwise the last URL used falls back in."""
+        if (self.download_url.value or "").strip():
+            return
+        text = await self._read_clipboard()
+        if re.match(r"^https?://\S+$", text or ""):
+            self.download_url.value = text
+            self._refresh(immediate=True)
+            return
+        last = (self.config.get("last_url") or "").strip()
+        if last:
+            self.download_url.value = last
+            self._refresh(immediate=True)
 
     # ========================= codec / category events ============================
 
@@ -1929,6 +2065,7 @@ class VideoToolApp:
             cookiefile = (self.cookies_file.value or "").strip()
         opts = {
             "impersonate": bool(self.toggle_impersonate.value) and self.impersonate_ok,
+            "impersonate_available": self.impersonate_ok,
             "sponsorblock": bool(self.toggle_sponsorblock.value),
             "embed": bool(self.toggle_embed.value),
             "subs": bool(self.toggle_subs.value),
@@ -1978,6 +2115,7 @@ class VideoToolApp:
             return
 
         self.config.set("last_output_folder", out_dir)
+        self.config.set("last_url", url)
 
         self.download_status.value = "Downloading ..."
         self.download_progress.value = 0
@@ -2016,41 +2154,69 @@ class VideoToolApp:
     ) -> list[str]:
         cmd: list[str] = [self.binaries.get_ytdlp_path()]
 
+        # NOTE: postprocessor args are scoped to the specific postprocessor
+        # (ExtractAudio / Merger) instead of the global "ffmpeg:" prefix.
+        # The global prefix applied the audio re-encode to EVERY ffmpeg
+        # pass - merge, thumbnail embed, metadata embed - i.e. the audio
+        # was re-encoded up to three times per download (generation loss
+        # + noticeably slower).
         if quality == "audio_wav":
             cmd.extend([
                 "-x", "--audio-format", "wav",
-                "--postprocessor-args", "ffmpeg:-ar 48000 -ac 2 -c:a pcm_s16le",
+                "--postprocessor-args", "ExtractAudio:-ar 48000 -ac 2 -c:a pcm_s16le",
             ])
         elif quality == "audio":
             cmd.extend([
                 "-x", "--audio-format", "mp3", "--audio-quality", "0",
-                "--postprocessor-args", "ffmpeg_o:-codec:a libmp3lame -b:a 320k -ar 44100 -ac 2",
+                "--postprocessor-args", "ExtractAudio:-codec:a libmp3lame -b:a 320k -ar 44100 -ac 2",
             ])
         elif quality == "audio_opus":
             cmd.extend([
                 "-x", "--audio-format", "opus", "--audio-quality", "0",
             ])
         else:
-            # Format selection - with AV1 preference or classic H.264/AAC
+            # Format selection - with AV1 preference or classic H.264/AAC.
+            # AAC transcode only in the merge step; the embed steps just
+            # keep +faststart without touching the streams again.
             cmd.extend([
                 "--merge-output-format", "mp4",
                 "--postprocessor-args",
-                "ffmpeg:-c:a aac -b:a 192k -ar 48000 -ac 2 -movflags +faststart",
+                "Merger:-c:a aac -b:a 192k -ar 48000 -ac 2 -movflags +faststart",
+                "--postprocessor-args", "Metadata:-movflags +faststart",
+                "--postprocessor-args", "EmbedThumbnail:-movflags +faststart",
             ])
+            # NOTE on the fallback chains: the old chains jumped from
+            # "avc1 video + m4a audio" straight to "any video + any audio"
+            # and then to "b" (the single pre-merged file). On YouTube the
+            # pre-merged fallback is the 360p format - and on sites whose
+            # audio isn't m4a (Instagram HLS, etc.) the first alternative
+            # never matched. Each chain now degrades gracefully:
+            # h264+m4a -> h264+any audio -> any video+audio -> pre-merged.
             if quality == "best_av1":
                 # AV1 if available, otherwise best available
                 cmd.extend([
-                    "-f", "bv*[vcodec^=av01]+ba/bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b",
+                    "-f", ("bv*[vcodec^=av01]+ba/"
+                           "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/"
+                           "bv*[vcodec^=avc1]+ba/"
+                           "bv*+ba/b"),
                     "-S", "vcodec:av01,res,acodec:m4a",
                 ])
             elif quality == "best":
                 cmd.extend([
-                    "-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b",
+                    "-f", ("bv*[vcodec^=avc1]+ba[acodec^=mp4a]/"
+                           "bv*[vcodec^=avc1]+ba/"
+                           "bv*+ba/b"),
                     "-S", "vcodec:h264,res,acodec:m4a",
                 ])
             else:
+                # Fixed resolution: cap the height in the filter itself
+                # (not only via -S sorting) so an oversized format is never
+                # chosen, but keep uncapped alternatives as a last resort.
                 cmd.extend([
-                    "-f", "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*+ba/b",
+                    "-f", (f"bv*[vcodec^=avc1][height<={quality}]+ba[acodec^=mp4a]/"
+                           f"bv*[vcodec^=avc1][height<={quality}]+ba/"
+                           f"bv*[height<={quality}]+ba/"
+                           "bv*+ba/b"),
                     "-S", f"res:{quality},vcodec:h264,acodec:m4a",
                 ])
 
@@ -2140,8 +2306,17 @@ class VideoToolApp:
                 "--sponsorblock-mark", "all",
             ])
 
-        # Anti-Bot Impersonation
-        if opts.get("impersonate"):
+        # Anti-bot impersonation. Instagram/TikTok/X block yt-dlp's plain
+        # TLS fingerprint outright, so impersonation is force-enabled for
+        # those hosts whenever curl_cffi is available - even if the toggle
+        # is off. This is the single most common cause of failed Instagram
+        # downloads.
+        impersonate = bool(opts.get("impersonate"))
+        if not impersonate and opts.get("impersonate_available"):
+            lo_url = url.lower()
+            if any(h in lo_url for h in _IMPERSONATE_AUTO_HOSTS):
+                impersonate = True
+        if impersonate:
             base_args.extend(["--impersonate", "chrome"])
 
         # Cookies: either straight from the browser (Firefox/Safari are
@@ -2158,12 +2333,51 @@ class VideoToolApp:
         cmd.append(url)
         return cmd
 
+    def _log_preflight_hints(
+        self, url: str, quality: str, cookies: str | None, opts: dict,
+    ) -> None:
+        """Warns about known problem setups BEFORE the download starts,
+        instead of leaving the user to decode a yt-dlp error afterwards."""
+        lo = url.lower()
+        has_cookies = bool(cookies) or bool(opts.get("cookiefile"))
+        is_audio = quality in ("audio", "audio_wav", "audio_opus")
+        if ("youtube.com" in lo or "youtu.be" in lo) and not is_audio:
+            if not self.js_runtime:
+                self._append_log(
+                    "download",
+                    "Warning: no JS runtime (Deno) found - YouTube often only "
+                    "offers 360p without one. Setup tab -> 'Install Deno'.",
+                )
+            elif not has_cookies and not opts.get("potoken"):
+                self._append_log(
+                    "download",
+                    "Note: without cookies or a PO token, YouTube may withhold "
+                    "some HD formats. If the result is low-res, set cookies or "
+                    "enable the PO token option.",
+                )
+        if "instagram.com" in lo:
+            if not has_cookies:
+                self._append_log(
+                    "download",
+                    "Note: Instagram often requires login cookies. If this "
+                    "download fails, pick a cookies option (cookies.txt is the "
+                    "most reliable).",
+                )
+            if not opts.get("impersonate_available"):
+                self._append_log(
+                    "download",
+                    "Warning: browser impersonation is unavailable - Instagram "
+                    "usually blocks downloads without it. Update yt-dlp in the "
+                    "Setup tab (the official binary includes curl_cffi).",
+                )
+
     def _run_download(
         self, url: str, out_dir: str, quality: str,
         cookies: str | None, opts: dict,
     ) -> None:
         try:
             cmd = self._build_download_cmd(url, out_dir, quality, cookies, opts)
+            self._log_preflight_hints(url, quality, cookies, opts)
 
             proc = subprocess.Popen(
                 cmd,
@@ -2239,6 +2453,19 @@ class VideoToolApp:
                         "yt-dlp's Nightly/Master channel but not yet in Stable. "
                         "Setup tab -> set Channel to 'Nightly' or 'Master' -> "
                         "'Update yt-dlp'.",
+                    )
+                elif ("requested format is not available" in log_text_lower
+                      or "some formats may be missing" in log_text_lower
+                      or "missing a url" in log_text_lower
+                      or "please sign in" in log_text_lower
+                      or "login required" in log_text_lower):
+                    self._append_log(
+                        "download",
+                        "Tip: The site withheld formats or wants a login. "
+                        "Try: (1) set cookies (cookies.txt is most reliable), "
+                        "(2) install Deno in the Setup tab, (3) for YouTube "
+                        "18+/HD issues enable the PO token option, (4) update "
+                        "yt-dlp (Nightly channel often has the fix).",
                     )
                 elif not self.js_runtime:
                     self._append_log(
