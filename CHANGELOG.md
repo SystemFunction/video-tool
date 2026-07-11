@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.0.3 — 2026-07-12
+
+### Added
+
+- **Built-in one-click self-update.** On startup the app checks GitHub for a newer version. If one is found, a dialog asks whether you want it — one click on "Install & restart" downloads the update, installs it and restarts the app. The yellow "Update available" chip in the header and the "Check for Updates" button on the Info tab open the same dialog. The downloaded file is syntax-checked before it replaces anything, so a broken download can never brick the tool.
+
 ## v0.0.2 — 2026-07-10
 
 ### Fixed

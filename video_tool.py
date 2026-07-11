@@ -75,7 +75,7 @@ import flet as ft  # noqa: E402
 
 # ============================== constants =========================================
 
-VERSION = "0.0.2"
+VERSION = "0.0.3"
 APP_NAME = "Video Tool"
 
 # GitHub repo ("owner/name") used by the built-in self-update check
