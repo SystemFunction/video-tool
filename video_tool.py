@@ -78,10 +78,16 @@ import flet as ft  # noqa: E402
 VERSION = "0.0.2"
 APP_NAME = "Video Tool"
 
-# Set this to your GitHub repo ("owner/name") before publishing to enable
-# the built-in self-update check (Info tab / startup notice).
-# Replace "yourusername" with your GitHub handle, e.g. "gen/video-tool".
-GITHUB_REPO = "yourusername/video-tool"
+# GitHub repo ("owner/name") used by the built-in self-update check
+# (startup dialog / Info tab). The check reads VERSION straight from
+# video_tool.py on GITHUB_BRANCH, so no GitHub release is required -
+# pushing a commit with a higher VERSION is enough.
+GITHUB_REPO = "SystemFunction/video-tool"
+GITHUB_BRANCH = "main"
+UPDATE_RAW_URL = (
+    f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/video_tool.py"
+)
+UPDATE_PAGE_URL = f"https://github.com/{GITHUB_REPO}"
 APP_DIR = Path.home() / ".video_tool_v3"
 MAX_LOG = 1200
 REFRESH_MIN_INTERVAL = 0.08  # 80ms minimum between UI refreshes
@@ -292,30 +298,29 @@ def _parse_version(text: str) -> tuple[int, ...]:
     return tuple(int(n) for n in nums) if nums else (0,)
 
 
-def check_tool_update(timeout: int = 8) -> tuple[bool, str, str]:
-    """Checks GitHub Releases for a newer version of this tool itself.
+def check_tool_update(timeout: int = 10) -> tuple[bool, str, str]:
+    """Checks GitHub for a newer version of this tool itself.
 
-    Set GITHUB_REPO (top of file) to "owner/name" to enable this. Returns
-    (has_update, latest_version, release_url) - (False, "", "") on any
-    failure or if GITHUB_REPO hasn't been configured.
+    Fetches video_tool.py from GITHUB_BRANCH and compares its VERSION
+    constant against the running one - this works without GitHub
+    releases. Returns (has_update, latest_version, source_text) so the
+    already-downloaded file can be installed directly;
+    (False, "", "") on any failure or if GITHUB_REPO isn't configured.
     """
     if not GITHUB_REPO or GITHUB_REPO.startswith("yourusername"):
         return False, "", ""
     import requests
     try:
-        r = requests.get(
-            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-            timeout=timeout, headers={"Accept": "application/vnd.github+json"},
-        )
+        r = requests.get(UPDATE_RAW_URL, timeout=timeout)
         if r.status_code != 200:
             return False, "", ""
-        data = r.json()
-        tag = (data.get("tag_name") or "").strip().lstrip("vV")
-        url = data.get("html_url", "")
-        if not tag:
+        source = r.text
+        m = re.search(r'^VERSION\s*=\s*["\']([^"\']+)["\']', source, re.M)
+        if not m:
             return False, "", ""
-        has_update = _parse_version(tag) > _parse_version(VERSION)
-        return has_update, tag, url
+        latest = m.group(1).strip()
+        has_update = _parse_version(latest) > _parse_version(VERSION)
+        return has_update, latest, source
     except Exception:
         return False, "", ""
 
@@ -778,7 +783,7 @@ class VideoToolApp:
         # self-update state (tool version, not yt-dlp/FFmpeg)
         self.tool_update_available = False
         self.tool_update_version = ""
-        self.tool_update_url = ""
+        self.tool_update_source = ""  # downloaded video_tool.py, ready to install
 
         self._init_page()
         self._build_ui()
@@ -1094,8 +1099,8 @@ class VideoToolApp:
             visible=self.tool_update_available,
             border_radius=14, padding=ft.Padding(left=10, right=10, top=6, bottom=6),
             bgcolor=ft.Colors.AMBER_700,
-            tooltip="Click to open the release page",
-            on_click=self._open_tool_update_url,
+            tooltip="Click to install the update",
+            on_click=self._show_update_dialog,
             content=ft.Row(spacing=4, controls=[
                 ft.Icon(ft.Icons.SYSTEM_UPDATE, size=14, color=ft.Colors.WHITE),
                 self.update_chip_text,
@@ -3126,19 +3131,20 @@ class VideoToolApp:
         self.page.run_thread(self._check_tool_update_worker, True)
 
     def _check_tool_update_worker(self, manual: bool = False) -> None:
-        has_update, latest, url = check_tool_update()
+        has_update, latest, source = check_tool_update()
         self.tool_update_available = has_update
         self.tool_update_version = latest
-        self.tool_update_url = url
+        self.tool_update_source = source if has_update else ""
         if hasattr(self, "update_chip"):
             self.update_chip.visible = has_update
             if has_update and hasattr(self, "update_chip_text"):
                 self.update_chip_text.value = f"Update available: v{latest}"
             self._refresh(immediate=True)
-        if manual:
-            if has_update:
-                self._toast(f"A new version is available: v{latest}")
-            elif GITHUB_REPO.startswith("yourusername"):
+        if has_update:
+            # Ask the user right away - one click installs the update.
+            self._show_update_dialog()
+        elif manual:
+            if GITHUB_REPO.startswith("yourusername"):
                 self._toast(
                     "Self-update check is not configured yet - set GITHUB_REPO "
                     "at the top of the script.", error=True,
@@ -3146,12 +3152,91 @@ class VideoToolApp:
             else:
                 self._toast("You're running the latest version")
 
-    def _open_tool_update_url(self, e=None) -> None:
-        if self.tool_update_url:
+    def _show_update_dialog(self, e=None) -> None:
+        if not self.tool_update_available:
+            return
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Row(spacing=10, controls=[
+                ft.Icon(ft.Icons.SYSTEM_UPDATE, color=ft.Colors.AMBER_400),
+                ft.Text("Update available"),
+            ]),
+            content=ft.Text(
+                f"Version {self.tool_update_version} is available on GitHub "
+                f"(installed: {VERSION}).\n\n"
+                "Install now? The tool updates itself and restarts."
+            ),
+            actions=[
+                ft.TextButton("Later", on_click=self._close_dialog),
+                ft.FilledButton(
+                    "Install & restart", icon=ft.Icons.DOWNLOAD,
+                    on_click=self._apply_tool_update,
+                ),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        self._open_dialog = dlg
+        # Prefers page.open (Flet 0.28+), falls back for older releases.
+        for opener in (
+            lambda: self.page.open(dlg),
+            lambda: self.page.show_dialog(dlg),
+        ):
             try:
-                self.page.launch_url(self.tool_update_url)
+                opener()
+                break
+            except Exception:
+                continue
+        self._refresh(immediate=True)
+
+    def _apply_tool_update(self, e=None) -> None:
+        self._close_dialog()
+        if getattr(sys, "frozen", False):
+            # A frozen build (PyInstaller etc.) can't replace itself -
+            # send the user to the repo page instead.
+            try:
+                self.page.launch_url(UPDATE_PAGE_URL)
             except Exception:
                 pass
+            return
+        self._toast(f"Installing update v{self.tool_update_version} ...")
+        self.page.run_thread(self._apply_tool_update_worker)
+
+    def _apply_tool_update_worker(self) -> None:
+        try:
+            source = self.tool_update_source
+            if not source:
+                _has, _latest, source = check_tool_update(timeout=30)
+                if not source:
+                    raise RuntimeError("Could not download the update")
+            # Never overwrite the script with a file that doesn't even
+            # parse - a broken update would brick the tool.
+            compile(source, "video_tool.py", "exec")
+            target = Path(__file__).resolve()
+            tmp = target.with_suffix(".py.new")
+            tmp.write_text(source, encoding="utf-8")
+            os.replace(tmp, target)  # atomic swap
+        except Exception as ex:
+            self._toast(f"Update failed: {ex}", error=True)
+            return
+        self._toast("Update installed - restarting ...")
+        time.sleep(1.5)
+        self._restart_self(target)
+
+    def _restart_self(self, script: Path) -> None:
+        """Launches the (updated) script as a new process and closes
+        this instance."""
+        self._cleanup_processes()
+        try:
+            subprocess.Popen(
+                [sys.executable, str(script)], cwd=str(script.parent),
+            )
+        except Exception as ex:
+            self._toast(f"Restart failed - please restart manually: {ex}", error=True)
+            return
+        try:
+            self.page.window.destroy()
+        except Exception:
+            os._exit(0)
 
 
 # ============================== entry point =======================================
