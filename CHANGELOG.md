@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.0.4 — 2026-07-12
+
+### Fixed
+
+- **Instagram "empty media response" failures.** The bug (yt-dlp #17074) is fixed in the yt-dlp Stable release 2026.07.04 — switching to the Nightly channel is no longer necessary. The app now knows the fixed version: if your yt-dlp is older, it warns you *before* an Instagram download starts and tells you exactly what to do (Setup tab → "Update yt-dlp", Stable channel). The failure tip after an "empty media response" error was updated accordingly and now shows your installed version when it is the culprit.
+
 ## v0.0.3 — 2026-07-12
 
 ### Added

@@ -75,8 +75,13 @@ import flet as ft  # noqa: E402
 
 # ============================== constants =========================================
 
-VERSION = "0.0.3"
+VERSION = "0.0.4"
 APP_NAME = "Video Tool"
+
+# First stable yt-dlp release with the reworked Instagram extractor that
+# fixes the "empty media response" error (yt-dlp #17074, PR #17075).
+# Older versions fail on most Instagram posts.
+YTDLP_INSTAGRAM_FIX = "2026.07.04"
 
 # GitHub repo ("owner/name") used by the built-in self-update check
 # (startup dialog / Info tab). The check reads VERSION straight from
@@ -296,6 +301,17 @@ def _supports_impersonation(ytdlp_path: str) -> bool:
 def _parse_version(text: str) -> tuple[int, ...]:
     nums = re.findall(r"\d+", text or "")
     return tuple(int(n) for n in nums) if nums else (0,)
+
+
+def _ytdlp_older_than(installed: str, required: str) -> bool:
+    """True when `installed` is a parseable yt-dlp CalVer string
+    ("YYYY.MM.DD[.rev]") older than `required`. Unparseable values
+    (e.g. "Checking ...", "Not installed") return False - no warning
+    is better than a wrong one."""
+    inst = _parse_version(installed)
+    if len(inst) < 3:
+        return False
+    return inst[:3] < _parse_version(required)[:3]
 
 
 def check_tool_update(timeout: int = 10) -> tuple[bool, str, str]:
@@ -675,8 +691,7 @@ class BinaryManager:
         mechanism. This works against the standalone binary we manage here
         (it's the official frozen build with an embedded self-updater) and
         is the documented way to pick up fixes that have landed on
-        Nightly/Master but not yet in a Stable release - see e.g.
-        https://github.com/yt-dlp/yt-dlp/issues/17074.
+        Nightly/Master but not yet in a Stable release.
         Returns combined stdout/stderr from the update command.
         """
         self.invalidate_cache()
@@ -1706,11 +1721,12 @@ class VideoToolApp:
             value=self.config.get("ytdlp_channel", "stable"),
             width=230, border_radius=10,
             tooltip=(
-                "Site-specific bug fixes (e.g. the Instagram \"empty media "
-                "response\" error, yt-dlp #17074) often land in Nightly/Master "
-                "days or weeks before the next Stable release. If a download "
+                "Site-specific bug fixes often land in Nightly/Master days "
+                "or weeks before the next Stable release. If a download "
                 "fails with a known extractor bug, switch the channel here "
-                "and click 'Update yt-dlp'."
+                "and click 'Update yt-dlp'. (The Instagram \"empty media "
+                "response\" fix, yt-dlp #17074, is in Stable since "
+                f"{YTDLP_INSTAGRAM_FIX}.)"
             ),
             options=[
                 ft.dropdown.Option("stable", "Stable (recommended)"),
@@ -2361,6 +2377,15 @@ class VideoToolApp:
                     "enable the PO token option.",
                 )
         if "instagram.com" in lo:
+            if _ytdlp_older_than(self.ytdlp_version, YTDLP_INSTAGRAM_FIX):
+                self._append_log(
+                    "download",
+                    f"Warning: yt-dlp {self.ytdlp_version} is too old for "
+                    "Instagram - versions before "
+                    f"{YTDLP_INSTAGRAM_FIX} fail with an \"empty media "
+                    "response\" error (yt-dlp #17074). Setup tab -> "
+                    "'Update yt-dlp' (Stable channel).",
+                )
             if not has_cookies:
                 self._append_log(
                     "download",
@@ -2451,13 +2476,25 @@ class VideoToolApp:
                 self._append_log("download", f"\n=== Download failed (code {code}) ===")
                 log_text_lower = "\n".join(self.download_log_lines).lower()
                 if "empty media response" in log_text_lower:
+                    if _ytdlp_older_than(self.ytdlp_version, YTDLP_INSTAGRAM_FIX):
+                        detail = (
+                            f"Your yt-dlp is {self.ytdlp_version}; the fix "
+                            f"shipped in Stable {YTDLP_INSTAGRAM_FIX}. "
+                            "Setup tab -> 'Update yt-dlp' (Stable channel), "
+                            "then retry."
+                        )
+                    else:
+                        detail = (
+                            "Your yt-dlp should already contain the fix - "
+                            "if this persists, try login cookies "
+                            "(cookies.txt) or the Nightly channel in the "
+                            "Setup tab."
+                        )
                     self._append_log(
                         "download",
-                        "Tip: This looks like the known Instagram \"empty media "
-                        "response\" bug (yt-dlp #17074) - the fix has landed in "
-                        "yt-dlp's Nightly/Master channel but not yet in Stable. "
-                        "Setup tab -> set Channel to 'Nightly' or 'Master' -> "
-                        "'Update yt-dlp'.",
+                        "Tip: This is the known Instagram \"empty media "
+                        "response\" bug (yt-dlp #17074), fixed in yt-dlp "
+                        f"{YTDLP_INSTAGRAM_FIX}. " + detail,
                     )
                 elif ("requested format is not available" in log_text_lower
                       or "some formats may be missing" in log_text_lower
@@ -3077,8 +3114,7 @@ class VideoToolApp:
             if channel == "stable":
                 self.binaries.install_ytdlp(on_progress=_progress)
             else:
-                # Nightly/Master builds often carry site-specific fixes (e.g.
-                # the Instagram "empty media response" bug, yt-dlp #17074)
+                # Nightly/Master builds often carry site-specific fixes
                 # days or weeks before they reach a Stable release. This uses
                 # yt-dlp's own --update-to self-updater against the binary
                 # we already have installed.
