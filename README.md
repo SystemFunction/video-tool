@@ -2,7 +2,7 @@
 
 A cross-platform desktop app for **downloading videos with [yt-dlp](https://github.com/yt-dlp/yt-dlp)** and **converting them with [FFmpeg](https://ffmpeg.org/)** — wrapped in a clean [Flet](https://flet.dev/) GUI. It manages its own copies of `yt-dlp`, `ffmpeg`/`ffprobe` and an optional JavaScript runtime, so you don't have to install or wire up any of them by hand.
 
-> Current version: **0.0.1**
+> Current version: **0.0.5** — see the [changelog](CHANGELOG.md).
 
 ---
 
@@ -14,6 +14,7 @@ A cross-platform desktop app for **downloading videos with [yt-dlp](https://gith
 - **Release-channel switch** — pick `Stable`, `Nightly` or `Master` for yt-dlp and update in place via yt-dlp's own `--update-to`, so you can pick up site-bug fixes that haven't reached a stable release yet.
 - **PO token support** — works with the [bgutil PO token provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) plugin for content that requires a GVS PO token.
 - **Cookies** from your browser or from an exported `cookies.txt` for age-restricted/private content.
+- **Existing-file handling** — when a download would overwrite a file that is already there, choose per job whether to be asked for a new name, auto-rename (`Title (1).mp4`), overwrite, or skip. No more silent "skipped but reported as done" downloads.
 - **Subtitles** (write + auto-subs, embed, convert to SRT), **SponsorBlock**, **metadata/thumbnail/chapter embedding**, and **request impersonation** to reduce bot blocks.
 - **Built-in self-update check** for the app itself against GitHub Releases.
 - Responsive UI: binary probing runs in the background, so the window appears instantly.

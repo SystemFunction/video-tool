@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.0.5 — 2026-07-13
+
+### Fixed
+
+- **Downloads that silently did nothing when the file already existed.** If the target folder already contained a video with the same name, yt-dlp skipped the download — but reported success, so the log looked exactly like a completed download while no new file was written. The app now checks the target file name *before* the download starts and never claims success when nothing was downloaded.
+
+### Added
+
+- **"If file exists" — you decide what happens.** A new dropdown next to Quality and Cookies on the Download tab, remembered between sessions:
+  - **Ask me** (default) — a dialog shows which file is in the way and lets you type a new name (pre-filled with a free one), overwrite the existing file, or skip.
+  - **Auto-rename** — saves as `Title (1).mp4`, `Title (2).mp4`, … without asking.
+  - **Overwrite** — replaces the existing file.
+  - **Skip** — keeps the existing file and says so clearly instead of pretending to download.
+
+  The file extension is always chosen by the download itself, so a renamed file can never end up with a wrong or misleading extension — including audio-only downloads, where the final `.mp3`/`.wav`/`.opus` file is correctly recognized as an existing file.
+
 ## v0.0.4 — 2026-07-12
 
 ### Fixed

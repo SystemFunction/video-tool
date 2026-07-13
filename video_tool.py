@@ -75,7 +75,7 @@ import flet as ft  # noqa: E402
 
 # ============================== constants =========================================
 
-VERSION = "0.0.4"
+VERSION = "0.0.5"
 APP_NAME = "Video Tool"
 
 # First stable yt-dlp release with the reworked Instagram extractor that
@@ -98,6 +98,7 @@ MAX_LOG = 1200
 REFRESH_MIN_INTERVAL = 0.08  # 80ms minimum between UI refreshes
 DOWNLOAD_CHUNK = 1 << 17     # 128 KiB streaming chunks for binary installer
 PROC_WAIT_TIMEOUT = 15       # seconds to wait on .wait() after stop
+PROBE_TIMEOUT = 90           # seconds for the "what will the file be called?" probe
 
 # subprocess flags (hide console windows on Windows)
 _POPEN_KWARGS: dict = {}
@@ -260,6 +261,70 @@ def _safe_terminate(proc: subprocess.Popen | None) -> None:
                     pass
     except Exception:
         pass
+
+
+# ---- target file name handling (existing-file collisions) ----------------------
+
+_ILLEGAL_FS_CHARS = '<>:"/\\|?*'
+
+
+def sanitize_filename(name: str) -> str:
+    """Makes a user-typed file name safe for the filesystem: strips path
+    separators and characters Windows rejects, and caps the length."""
+    cleaned = "".join(
+        "_" if (ch in _ILLEGAL_FS_CHARS or ord(ch) < 32) else ch
+        for ch in name
+    )
+    cleaned = cleaned.strip().rstrip(". ")
+    return cleaned[:200]
+
+
+def unique_path(path: Path) -> Path:
+    """Returns `path` if it is free, otherwise the first free variant with a
+    counter suffix - "clip.mp4" -> "clip (1).mp4" -> "clip (2).mp4" ..."""
+    if not path.exists():
+        return path
+    for i in range(1, 1000):
+        candidate = path.with_name(f"{path.stem} ({i}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.stem} ({int(time.time())}){path.suffix}")
+
+
+def escape_outtmpl(path: str) -> str:
+    """Escapes a literal path for use as a yt-dlp output template. yt-dlp
+    runs the template through %-formatting, so a bare '%' in a title would
+    crash it; '%%' is the escape for a literal percent sign."""
+    return path.replace("%", "%%")
+
+
+def outtmpl_for(path: Path) -> str:
+    """Turns a concrete target path into a yt-dlp output template. The
+    extension is left to yt-dlp (%(ext)s) - it only knows the real container
+    after format selection/merging/audio extraction, so hard-coding it here
+    could mislabel the file."""
+    return escape_outtmpl(str(path.with_suffix(""))) + ".%(ext)s"
+
+
+_MEDIA_EXTS = {
+    ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".avi", ".flv", ".ts",
+    ".mp3", ".m4a", ".wav", ".opus", ".flac", ".aac", ".ogg", ".oga",
+}
+
+
+def strip_media_ext(name: str) -> str:
+    """Drops a media extension the user typed, so the real container decides
+    the extension - "clip.mkv" must not end up on an MP4 file."""
+    suffix = Path(name).suffix.lower()
+    return Path(name).stem if suffix in _MEDIA_EXTS else name
+
+
+# Audio-only downloads end up with these extensions after postprocessing.
+_AUDIO_EXT_BY_QUALITY = {
+    "audio": ".mp3",
+    "audio_wav": ".wav",
+    "audio_opus": ".opus",
+}
 
 
 def _detect_hw_encoder() -> str:
@@ -973,6 +1038,20 @@ class VideoToolApp:
 
     # ========================= dialogs ============================================
 
+    def _show_dialog(self, dlg: ft.AlertDialog) -> None:
+        self._open_dialog = dlg
+        # Prefers page.open (Flet 0.28+), falls back for older releases.
+        for opener in (
+            lambda: self.page.open(dlg),
+            lambda: self.page.show_dialog(dlg),
+        ):
+            try:
+                opener()
+                break
+            except Exception:
+                continue
+        self._refresh(immediate=True)
+
     def _close_dialog(self, e=None) -> None:
         dlg = getattr(self, "_open_dialog", None)
         # Prefers page.close (Flet 0.28+), falls back for older releases.
@@ -1294,6 +1373,30 @@ class VideoToolApp:
             on_select=lambda e: self.config.set("last_quality", e.control.value),
         )
 
+        # What to do when the target file already exists. yt-dlp's default is
+        # to silently skip the download ("has already been downloaded"), which
+        # looks like a successful download in the log - hence this choice.
+        self.download_conflict = ft.Dropdown(
+            label="If file exists",
+            value=self.config.get("conflict_mode", "ask"),
+            width=250, border_radius=10,
+            tooltip=(
+                "What happens when the target folder already contains a file "
+                "with the same name:\n"
+                "Ask me - a dialog lets you pick the name\n"
+                "Auto-rename - saves as 'Title (1).mp4'\n"
+                "Overwrite - replaces the existing file\n"
+                "Skip - keeps the existing file, downloads nothing"
+            ),
+            options=[
+                ft.dropdown.Option("ask", "Ask me (choose the name)"),
+                ft.dropdown.Option("rename", "Auto-rename - Title (1).mp4"),
+                ft.dropdown.Option("overwrite", "Overwrite existing file"),
+                ft.dropdown.Option("skip", "Skip (keep existing file)"),
+            ],
+            on_select=lambda e: self.config.set("conflict_mode", e.control.value),
+        )
+
         saved_cookies = self.config.get("last_cookies", "none")
         self.download_cookies = ft.Dropdown(
             label="Cookies (403 + Age-Restricted)",
@@ -1472,7 +1575,8 @@ class VideoToolApp:
             ft.Icons.LINK, "Source & Quality",
             ft.Row(controls=[self.download_url, paste_btn]),
             ft.Row(spacing=12, wrap=True,
-                   controls=[self.download_quality, self.download_cookies]),
+                   controls=[self.download_quality, self.download_cookies,
+                             self.download_conflict]),
             self.cookies_file_row,
             advanced_toggle,
             self.advanced_panel,
@@ -2095,6 +2199,7 @@ class VideoToolApp:
             "potoken": bool(self.toggle_potoken.value),
             "potoken_url": (self.potoken_url.value or "").strip(),
             "plugins_dir": str(self.binaries.plugins_dir),
+            "conflict": self.download_conflict.value or "ask",
         }
 
         if not url:
@@ -2172,7 +2277,14 @@ class VideoToolApp:
     def _build_download_cmd(
         self, url: str, out_dir: str, quality: str,
         cookies: str | None, opts: dict,
+        outtmpl: str | None = None, force_overwrite: bool = False,
     ) -> list[str]:
+        """Builds the yt-dlp command line.
+
+        `outtmpl` overrides the default title template - used to save under a
+        different name when the target file already exists. `force_overwrite`
+        replaces an existing file instead of skipping it.
+        """
         cmd: list[str] = [self.binaries.get_ytdlp_path()]
 
         # NOTE: postprocessor args are scoped to the specific postprocessor
@@ -2254,8 +2366,10 @@ class VideoToolApp:
             "--no-mtime",
             "--progress-template",
             "download:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s",
-            "-o", str(Path(out_dir) / "%(title).200B.%(ext)s"),
+            "-o", outtmpl or str(Path(out_dir) / "%(title).200B.%(ext)s"),
         ]
+        if force_overwrite:
+            base_args.append("--force-overwrites")
 
         # YouTube player clients.
         #   - tv + web_safari are currently the reliable clients;
@@ -2401,13 +2515,222 @@ class VideoToolApp:
                     "Setup tab (the official binary includes curl_cffi).",
                 )
 
+    # ---- existing-file collisions ----
+    #
+    # yt-dlp silently skips a download when the target file is already there
+    # ("has already been downloaded") and still exits with code 0 - so the log
+    # looked like a successful download while nothing was written. We now ask
+    # yt-dlp for the target file name up front (--print filename, no download)
+    # and act on it before the real run starts.
+
+    def _probe_target_path(
+        self, url: str, out_dir: str, quality: str,
+        cookies: str | None, opts: dict,
+    ) -> Path | None:
+        """Resolves the file yt-dlp *would* write, without downloading it.
+        Returns None if the name can't be determined (offline, extractor
+        error, cancelled) - the caller then falls back to yt-dlp's default."""
+        cmd = self._build_download_cmd(url, out_dir, quality, cookies, opts)
+        # Same command (format selection decides the extension), but simulated
+        # and printing only the resulting file name. --print implies --simulate.
+        probe_cmd = cmd[:-1] + ["--simulate", "--no-warnings",
+                                "--print", "filename", cmd[-1]]
+        proc = subprocess.Popen(
+            probe_cmd,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace",
+            env=self._subprocess_env(),
+            **_POPEN_KWARGS,
+        )
+        # Register the probe so the Stop button can kill it, too.
+        with self.download_lock:
+            self.download_process = proc
+        try:
+            out, _err = proc.communicate(timeout=PROBE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _safe_terminate(proc)
+            return None
+        except Exception:
+            return None
+        finally:
+            with self.download_lock:
+                if self.download_process is proc:
+                    self.download_process = None
+
+        if proc.returncode != 0 or self._dl_cancelled:
+            return None
+        lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+        if not lines:
+            return None
+        try:
+            target = Path(lines[-1])
+        except Exception:
+            return None
+        # In simulation yt-dlp reports the *source* extension for audio-only
+        # downloads (.webm/.m4a) - the audio extraction postprocessor only
+        # runs on a real download. Correct it to the format we ask for, or
+        # we'd check the wrong file for a collision.
+        audio_ext = _AUDIO_EXT_BY_QUALITY.get(quality)
+        if audio_ext and target.suffix.lower() != audio_ext:
+            target = target.with_suffix(audio_ext)
+        return target
+
+    def _ask_conflict(self, target: Path) -> tuple[str, Path | None]:
+        """Asks the user what to do about an existing file. Runs on the
+        download worker thread and blocks it until the dialog is answered
+        (or the download is stopped).
+
+        Returns ("rename", new_path) | ("overwrite", target) | ("cancel", None).
+        """
+        result: dict = {"decision": "cancel", "path": None}
+        done = threading.Event()
+        suggestion = unique_path(target)
+
+        name_field = ft.TextField(
+            label="Save as", value=suggestion.name,
+            border_radius=10, autofocus=True,
+        )
+
+        def finish(decision: str, path: Path | None = None) -> None:
+            result["decision"] = decision
+            result["path"] = path
+            self._close_dialog()
+            done.set()
+
+        def on_save(e=None) -> None:
+            cleaned = sanitize_filename(name_field.value or "")
+            stem = strip_media_ext(cleaned).strip().rstrip(". ")
+            if not stem:
+                name_field.error = "Please enter a file name."
+                self._refresh(immediate=True)
+                return
+            # The extension always comes from the download itself.
+            new_path = target.with_name(stem + target.suffix)
+            if new_path.exists():
+                name_field.error = "A file with this name already exists."
+                self._refresh(immediate=True)
+                return
+            name_field.error = None
+            finish("rename", new_path)
+
+        name_field.on_submit = on_save
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Row(spacing=10, controls=[
+                ft.Icon(ft.Icons.WARNING_AMBER_ROUNDED, color=ft.Colors.AMBER_400),
+                ft.Text("File already exists"),
+            ]),
+            content=ft.Column(tight=True, spacing=12, width=460, controls=[
+                ft.Text(f'"{target.name}" is already in the target folder.'),
+                ft.Text(
+                    "Save the download under a different name, overwrite the "
+                    "existing file, or skip it.",
+                    size=12, color=ft.Colors.GREY_400,
+                ),
+                name_field,
+            ]),
+            actions=[
+                ft.TextButton("Skip", on_click=lambda e: finish("cancel")),
+                ft.TextButton("Overwrite", on_click=lambda e: finish("overwrite", target)),
+                ft.FilledButton("Save as", icon=ft.Icons.SAVE_AS, on_click=on_save),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+            on_dismiss=lambda e: done.set(),
+        )
+
+        self.download_status.value = "Waiting for your decision ..."
+        self._show_dialog(dlg)
+        # Block the worker thread, but stay responsive to the Stop button.
+        while not done.wait(0.25):
+            if self._dl_cancelled:
+                self._close_dialog()
+                return "cancel", None
+        return result["decision"], result["path"]
+
+    def _resolve_conflict(
+        self, url: str, out_dir: str, quality: str,
+        cookies: str | None, opts: dict,
+    ) -> tuple[str | None, bool, bool]:
+        """Checks up front whether the target file already exists and applies
+        the user's "If file exists" choice.
+
+        Returns (outtmpl, force_overwrite, cancelled).
+        """
+        mode = opts.get("conflict", "ask")
+        if mode == "overwrite":
+            return None, True, False
+        if mode == "skip":
+            return None, False, False
+
+        self.download_status.value = "Checking target file ..."
+        self._refresh()
+        target = self._probe_target_path(url, out_dir, quality, cookies, opts)
+        if self._dl_cancelled:
+            return None, False, True
+        if target is None:
+            self._append_log(
+                "download",
+                "Note: could not determine the target file name in advance - "
+                "if a file with the same name exists, yt-dlp will skip the "
+                "download.",
+            )
+            return None, False, False
+        if not target.exists():
+            self._append_log("download", f"Target file: {target.name}")
+            return None, False, False
+
+        if mode == "rename":
+            new_path = unique_path(target)
+            self._append_log(
+                "download",
+                f'"{target.name}" already exists - saving as "{new_path.name}".',
+            )
+            return outtmpl_for(new_path), False, False
+
+        decision, new_path = self._ask_conflict(target)
+        if decision == "overwrite":
+            self._append_log(
+                "download", f'Overwriting the existing "{target.name}".',
+            )
+            return None, True, False
+        if decision == "rename" and new_path is not None:
+            self._append_log("download", f'Saving as "{new_path.name}".')
+            return outtmpl_for(new_path), False, False
+        return None, False, True  # skipped / stopped
+
     def _run_download(
         self, url: str, out_dir: str, quality: str,
         cookies: str | None, opts: dict,
     ) -> None:
         try:
-            cmd = self._build_download_cmd(url, out_dir, quality, cookies, opts)
             self._log_preflight_hints(url, quality, cookies, opts)
+
+            outtmpl, force_overwrite, cancelled = self._resolve_conflict(
+                url, out_dir, quality, cookies, opts,
+            )
+            if cancelled:
+                stopped = self._dl_cancelled  # Stop button vs. "Skip" in the dialog
+                self._dl_cancelled = True
+                self.download_progress.value = 0
+                if stopped:
+                    self.download_status.value = "Cancelled"
+                    self._append_log("download", "\n=== Download cancelled ===")
+                else:
+                    self.download_status.value = "Skipped - file already exists"
+                    self._append_log(
+                        "download",
+                        "\n=== Skipped - the existing file was kept ===",
+                    )
+                    self._toast("Skipped - the existing file was kept", error=True)
+                return
+
+            cmd = self._build_download_cmd(
+                url, out_dir, quality, cookies, opts,
+                outtmpl=outtmpl, force_overwrite=force_overwrite,
+            )
+            self.download_status.value = "Downloading ..."
+            self._refresh()
 
             proc = subprocess.Popen(
                 cmd,
@@ -2421,6 +2744,7 @@ class VideoToolApp:
                 self.download_process = proc
 
             last_progress_line = ""
+            skipped_existing = False
             try:
                 if proc.stdout is not None:
                     for raw in proc.stdout:
@@ -2434,6 +2758,11 @@ class VideoToolApp:
                             self._append_log("download", line)
                         if is_progress:
                             last_progress_line = line
+
+                        # yt-dlp skipped the file (exit code stays 0) - remember
+                        # it, so the summary doesn't claim a successful download.
+                        if "has already been downloaded" in line.lower():
+                            skipped_existing = True
 
                         if is_progress:
                             parts = [p.strip() for p in line[len("download:"):].split("|")]
@@ -2466,6 +2795,21 @@ class VideoToolApp:
             if cancelled:
                 self.download_status.value = "Cancelled"
                 self._append_log("download", "\n=== Download cancelled ===")
+            elif code == 0 and skipped_existing:
+                # Nothing was written - don't dress this up as a success.
+                self.download_progress.value = 0
+                self.download_status.value = "Nothing downloaded - file already exists"
+                self._append_log(
+                    "download",
+                    "\n=== Nothing downloaded - a file with this name already "
+                    "exists ===",
+                )
+                self._append_log(
+                    "download",
+                    "Tip: set 'If file exists' to 'Ask me', 'Auto-rename' or "
+                    "'Overwrite' to download it anyway.",
+                )
+                self._toast("Nothing downloaded - file already exists", error=True)
             elif code == 0:
                 self.download_progress.value = 1.0
                 self.download_status.value = "Download completed"
@@ -3211,18 +3555,7 @@ class VideoToolApp:
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        self._open_dialog = dlg
-        # Prefers page.open (Flet 0.28+), falls back for older releases.
-        for opener in (
-            lambda: self.page.open(dlg),
-            lambda: self.page.show_dialog(dlg),
-        ):
-            try:
-                opener()
-                break
-            except Exception:
-                continue
-        self._refresh(immediate=True)
+        self._show_dialog(dlg)
 
     def _apply_tool_update(self, e=None) -> None:
         self._close_dialog()
