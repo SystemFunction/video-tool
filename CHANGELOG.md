@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.0.6 — 2026-07-18
+
+### Added
+
+- **Convert to MP3 or WAV.** The Convert tab has a new **"Audio (MP3 / WAV)"** category for extracting the audio track from a local video file — as **MP3 (320 kbps)** or **WAV (PCM 16-bit)**. When an audio target is selected, the video-only controls (hardware encoder, bitrate mode, quality slider) are hidden, and the output file extension follows the selection automatically: `.mp3`/`.wav` for audio, back to `.mp4` when you switch to a video codec again. A hand-typed wrong extension is corrected before the conversion starts, so the output container always matches its name.
+
 ## v0.0.5 — 2026-07-13
 
 ### Fixed

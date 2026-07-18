@@ -2,14 +2,14 @@
 
 A cross-platform desktop app for **downloading videos with [yt-dlp](https://github.com/yt-dlp/yt-dlp)** and **converting them with [FFmpeg](https://ffmpeg.org/)** — wrapped in a clean [Flet](https://flet.dev/) GUI. It manages its own copies of `yt-dlp`, `ffmpeg`/`ffprobe` and an optional JavaScript runtime, so you don't have to install or wire up any of them by hand.
 
-> Current version: **0.0.5** — see the [changelog](CHANGELOG.md).
+> Current version: **0.0.6** — see the [changelog](CHANGELOG.md).
 
 ---
 
 ## Features
 
 - **Download** any site supported by yt-dlp, with per-job quality presets (video resolutions, audio-only as M4A/WAV/Opus).
-- **Convert** local media via FFmpeg with selectable codecs, bitrates and hardware-encoder backends.
+- **Convert** local media via FFmpeg with selectable codecs, bitrates and hardware-encoder backends — or extract the audio track as **MP3 (320 kbps)** or **WAV (PCM)**.
 - **Self-managing binaries** — the app downloads and updates `yt-dlp`, `ffmpeg`/`ffprobe` and (optionally) [Deno](https://deno.com/) into its own folder. yt-dlp downloads are **verified against the release's signed `SHA2-256SUMS`** before use.
 - **Release-channel switch** — pick `Stable`, `Nightly` or `Master` for yt-dlp and update in place via yt-dlp's own `--update-to`, so you can pick up site-bug fixes that haven't reached a stable release yet.
 - **PO token support** — works with the [bgutil PO token provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider) plugin for content that requires a GVS PO token.
