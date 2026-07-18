@@ -75,7 +75,7 @@ import flet as ft  # noqa: E402
 
 # ============================== constants =========================================
 
-VERSION = "0.0.5"
+VERSION = "0.0.6"
 APP_NAME = "Video Tool"
 
 # First stable yt-dlp release with the reworked Instagram extractor that
@@ -142,6 +142,16 @@ CODEC_OPTIONS: dict[str, list[tuple[str, str]]] = {
         ("social", "Instagram / TikTok"),
         ("copy", "Copy stream"),
     ],
+    "audio": [
+        ("audio_mp3", "MP3 (320 kbps)"),
+        ("audio_wav", "WAV (PCM 16-bit)"),
+    ],
+}
+
+# Audio-only conversion targets force a matching output extension.
+_CONVERT_AUDIO_EXT = {
+    "audio_mp3": ".mp3",
+    "audio_wav": ".wav",
 }
 
 
@@ -1668,6 +1678,7 @@ class VideoToolApp:
                 ft.dropdown.Option("standard", "Standard"),
                 ft.dropdown.Option("editing", "Editing"),
                 ft.dropdown.Option("delivery", "Delivery"),
+                ft.dropdown.Option("audio", "Audio (MP3 / WAV)"),
             ],
             on_select=self.on_category_change,
         )
@@ -1901,7 +1912,7 @@ class VideoToolApp:
             ("Audio", "MP3 (CBR 320k), WAV/PCM or Opus"),
             ("Quality", "4K, 1440p, 1080p, 720p, 480p - with AV1 preference"),
             ("SponsorBlock", "Automatically remove or mark sponsors"),
-            ("Convert", "H.264, H.265, AV1 (SVT-AV1), ProRes 422, DNxHR, Vegas Sync Fix"),
+            ("Convert", "H.264, H.265, AV1 (SVT-AV1), ProRes 422, DNxHR, Vegas Sync Fix, MP3/WAV"),
             ("Hardware", "NVIDIA NVENC (multipass+lookahead), AMD AMF, Intel QSV, Auto-Detect"),
             ("HDR/Color", "Color metadata is preserved during conversion"),
             ("Settings", "Last save location and options are remembered"),
@@ -2122,7 +2133,10 @@ class VideoToolApp:
 
     def on_codec_change(self, e) -> None:
         key = self.codec_select.value or ""
-        if any(x in key for x in ("prores", "dnxhr", "vegas_fix")):
+        audio_only = key in _CONVERT_AUDIO_EXT
+        if audio_only:
+            self.hw_hint.value = "Note: audio only - the video track is discarded."
+        elif any(x in key for x in ("prores", "dnxhr", "vegas_fix")):
             self.hw_hint.value = "Note: this codec runs most stably on CPU."
         elif key == "copy":
             self.hw_hint.value = "Note: stream copy - no re-encoding."
@@ -2130,7 +2144,31 @@ class VideoToolApp:
             self.hw_hint.value = "Note: AV1 - very efficient, but slow on CPU."
         else:
             self.hw_hint.value = ""
+
+        # Video-only controls make no sense for an audio extraction.
+        self.hw_select.disabled = audio_only
+        self.bitrate_mode.disabled = audio_only
+        custom = self.bitrate_mode.value == "custom"
+        self.crf_container.visible = not audio_only and not custom
+        self.custom_bitrate_container.visible = not audio_only and custom
+
+        self._sync_output_ext(key)
         self._refresh(immediate=True)
+
+    def _sync_output_ext(self, codec_key: str) -> None:
+        """Keeps the output file extension in line with the selected codec:
+        audio targets force .mp3/.wav, and switching back to a video codec
+        restores .mp4 if an audio extension is still left over."""
+        out = (self.convert_output.value or "").strip()
+        if not out:
+            return
+        want = _CONVERT_AUDIO_EXT.get(codec_key)
+        p = Path(out)
+        if want:
+            if p.suffix.lower() != want:
+                self.convert_output.value = str(p.with_suffix(want))
+        elif p.suffix.lower() in _CONVERT_AUDIO_EXT.values():
+            self.convert_output.value = str(p.with_suffix(".mp4"))
 
     def on_bitrate_mode_change(self, e) -> None:
         custom = self.bitrate_mode.value == "custom"
@@ -2966,7 +3004,15 @@ class VideoToolApp:
         preset = "medium"
         extra: list[str] = []
 
+        audio_only = codec_key in _CONVERT_AUDIO_EXT
+
         match codec_key:
+            case "audio_mp3":
+                audio_codec = "libmp3lame"
+                audio_bitrate = "320k"
+            case "audio_wav":
+                audio_codec = "pcm_s16le"
+                audio_bitrate = None
             case "copy":
                 video_codec = audio_codec = "copy"
             case "vp9":
@@ -3075,8 +3121,8 @@ class VideoToolApp:
                     if is_h265:
                         extra.extend(["-tag:v", "hvc1", "-x265-params", "log-level=error"])
 
-        # custom bitrate override
-        if use_custom and video_codec not in ("copy", "prores_ks", "dnxhd"):
+        # custom bitrate override (video only - audio bitrates are fixed)
+        if use_custom and not audio_only and video_codec not in ("copy", "prores_ks", "dnxhd"):
             remove = {"-crf", "-cq", "-global_quality", "-qp_i", "-qp_p", "-qp_b"}
             filtered: list[str] = []
             skip = False
@@ -3096,6 +3142,7 @@ class VideoToolApp:
 
         return {
             "codec_key": codec_key,
+            "audio_only": audio_only,
             "video_codec": video_codec,
             "audio_codec": audio_codec,
             "audio_bitrate": audio_bitrate,
@@ -3127,6 +3174,12 @@ class VideoToolApp:
                 self._cv_running = False
             self._toast("Input file does not exist.", error=True)
             return
+        # Audio targets need a matching extension - ffmpeg picks the
+        # container from it, so a hand-typed .mp4 would break the output.
+        want_ext = _CONVERT_AUDIO_EXT.get(self.codec_select.value or "")
+        if want_ext and Path(out).suffix.lower() != want_ext:
+            out = str(Path(out).with_suffix(want_ext))
+            self.convert_output.value = out
         # Prevent the source file from being overwritten
         try:
             if Path(inp).resolve() == Path(out).resolve():
@@ -3173,6 +3226,25 @@ class VideoToolApp:
         self, ffmpeg: str, input_file: str, output_file: str,
         profile: dict, color_meta: dict[str, str],
     ) -> list[str]:
+        if profile.get("audio_only"):
+            # Audio extraction: drop the video track entirely. No color
+            # metadata, no faststart, no chapters (MP3 can't hold them).
+            cmd = [
+                ffmpeg, "-hide_banner", "-y",
+                "-progress", "pipe:1",
+                "-stats_period", "0.5",
+                "-nostats",
+                "-i", input_file,
+                "-vn",
+                "-map", "0:a:0",
+                "-map_metadata", "0",
+                "-c:a", profile["audio_codec"],
+            ]
+            if profile["audio_bitrate"]:
+                cmd.extend(["-b:a", profile["audio_bitrate"]])
+            cmd.append(output_file)
+            return cmd
+
         cmd: list[str] = [
             ffmpeg, "-hide_banner", "-y",
             "-progress", "pipe:1",
@@ -3245,11 +3317,14 @@ class VideoToolApp:
 
             cmd = self._build_ffmpeg_cmd(ffmpeg, input_file, output_file, profile, color_meta)
 
-            self._append_log("convert", f"Codec:  {profile['codec_key']} -> {profile['video_codec']}")
-            if profile["hw_requested"] == "auto":
-                self._append_log("convert", f"HW:     auto -> {profile['hw_resolved']}")
-            mode = f"Custom {profile['custom_br']}M" if profile["use_custom"] else f"CRF {profile['crf']}"
-            self._append_log("convert", f"Mode:   {mode}")
+            if profile["audio_only"]:
+                self._append_log("convert", f"Codec:  {profile['codec_key']} -> {profile['audio_codec']} (audio only)")
+            else:
+                self._append_log("convert", f"Codec:  {profile['codec_key']} -> {profile['video_codec']}")
+                if profile["hw_requested"] == "auto":
+                    self._append_log("convert", f"HW:     auto -> {profile['hw_resolved']}")
+                mode = f"Custom {profile['custom_br']}M" if profile["use_custom"] else f"CRF {profile['crf']}"
+                self._append_log("convert", f"Mode:   {mode}")
             if source_pix:
                 self._append_log("convert", f"Source: pix_fmt={source_pix}")
             if color_meta:
